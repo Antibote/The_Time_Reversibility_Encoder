@@ -1,44 +1,95 @@
 import argparse
 import numpy as np
 from PIL import Image
-from main import load_and_prepare_image, create_velocity_field, rk4_step, generate_gif
+from main import load_and_prepare_image, create_velocity_field, cabaret_step_full_numba, compute_dt_from_courant, generate_video, \
+    normalize_courant, cabaret_init_fluxes_numba
+
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Шифратор изображения с помощью схемы КАБАРЭ.")
-    parser.add_argument('--image', type=str, required=True, help='Путь к изображению для шифрования.')
-    parser.add_argument('--size', type=int, default=120, help='Размер сетки по каждой координате.')
-    parser.add_argument('--courant', type=float, default=0.5, help='Число Куранта.')
-    parser.add_argument('--frames_fwd', type=int, default=20, help='Количество кадров закручивания.')
-    parser.add_argument('--steps_per_frame', type=int, default=5, help='Количество шагов на каждый кадр.')
-    parser.add_argument('--factor', type=int, default=10, help='Фактор для увеличения количества кадров.')
-    parser.add_argument('--output_gif', type=str, default='encrypted_image.gif', help='Путь для сохранения GIF.')
-    parser.add_argument('--output_image', type=str, default='encrypted_image.png', help='Путь для сохранения зашифрованного изображения.')
-    return parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument('--image', required=True, help='Файл, который будем шифровать')
+    p.add_argument('--courant', type=float, required=True, help='Ключ (0 < C ≤ 1)')
+    p.add_argument('--frames_fwd', type=int, default=10, help='Количество кадров')
+    p.add_argument('--steps_per_frame', type=int, default=5, help='Количество шагов на один кадр')
+    p.add_argument('--factor', type=int, default=10, help='Увеличивает общее количество шагов схемы без изменения количества кадров в анимации')
+    p.add_argument('--passes', type=int, default=5, help='Число проходов для усиления шифрования')
+    p.add_argument('--out', default='encrypted_image.npz')
+    p.add_argument('--png', default='encrypted_image.png')
+    return p.parse_args()
 
+def auto_size(input_path: str) -> tuple[int, int]:
+    img = Image.open(input_path).convert("RGB")
+    weight, height = img.size
 
-def encrypt_image():
+    if abs(weight - height) < 5:
+        return 128, 128
+
+    if weight > height:
+        return 256, 128
+    else:
+        return 128, 256
+
+def perturb_velocity(u: np.ndarray, v: np.ndarray, pass_idx: int, master_key: float) -> tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed=int(master_key*1e6 + pass_idx))
+    factor = 0.05  # 5% perturbation
+    u_mod = u + factor * (rng.random(u.shape) - 0.5)
+    v_mod = v + factor * (rng.random(v.shape) - 0.5)
+    return u_mod, v_mod
+
+def encrypt():
     args = parse_args()
-    psi0 = load_and_prepare_image(args.image, size=args.size)
+    width, height = auto_size(args.image)
+    psi0 = load_and_prepare_image(args.image, width=width, height=height)
     ny, nx = psi0.shape
     u, v = create_velocity_field(nx, ny)
+    dx = 1.0 / nx; dy = 1.0 / ny
+    total_steps = args.frames_fwd * args.factor * args.steps_per_frame
+    steps_per_pass = total_steps // args.passes
+    courant = normalize_courant(args.courant)
+    psi = psi0.copy()
+    dt = compute_dt_from_courant(courant, u, v, dx, dy)  # фиксированный dt для всех проходов
 
-    # Генерация GIF с закручиванием (до полного шифрования)
-    generate_gif(psi0, u, v, args.courant, args.frames_fwd * args.factor, 0,  # Без обратного раскручивания
-                 args.steps_per_frame, args.output_gif)
+    for pass_idx in range(args.passes):
+        u_mod, v_mod = perturb_velocity(u, v, pass_idx, courant)
+        phi_x, phi_y = cabaret_init_fluxes_numba(psi)
 
-    # Шифрование изображения с использованием схемы КАБАРЭ
-    dt = args.courant / max(nx, ny)  # Вычисляем шаг по времени
-    encrypted_image = psi0.copy()
-    for _ in range(args.frames_fwd * args.factor):  # Процесс закручивания
-        for _ in range(args.steps_per_frame):
-            encrypted_image = rk4_step(encrypted_image, dt, 1.0 / nx, 1.0 / ny, u, v)
+        # Главный цикл
+        for _ in range(steps_per_pass):
+            psi, phi_x, phi_y = cabaret_step_full_numba(
+                psi, phi_x, phi_y, dt, dx, dy, u_mod, v_mod)
 
-    # Сохраняем зашифрованное изображение
-    img = Image.fromarray(((1 - np.clip(encrypted_image, 0, 1)) * 255).astype(np.uint8))
-    img.save(args.output_image)
-    print(f"Зашифрованное изображение сохранено в файл: {args.output_image}")
+    # Сохраняем точный массив и метаданные
+    np.savez(args.out,
+             psi=psi,
+             phi_x=phi_x,
+             phi_y=phi_y,
+             width=width,
+             height=height,
+             courant=courant,
+             frames_fwd=args.frames_fwd,
+             steps_per_frame=args.steps_per_frame,
+             factor=args.factor,
+             passes=args.passes)
+
+    # PNG визуализация
+    img_enc = (255.0 * (1.0 - np.clip(psi, 0.0, 1.0))).astype(np.uint8)
+    Image.fromarray(img_enc).save(args.png)
+
+    # Генерация видео
+    generate_video(
+        psi0, u, v, dt, dx, dy,
+        steps_per_pass=steps_per_pass,
+        passes=args.passes,
+        output_path="encrypted_video.mp4",
+        backward=False,
+        perturb_fn=lambda u, v, idx: perturb_velocity(u, v, idx, args.courant),
+        fps=100
+    )
+
+    print("Закодированная картинка создана и называется:", args.png)
+    print("Видео с кодирование создано и называется:", "encrypted_video.mp4")
 
 
-if __name__ == "__main__":
-    encrypt_image()
+if __name__ == '__main__':
+    encrypt()
